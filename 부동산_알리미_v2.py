@@ -206,9 +206,16 @@ def format_price_eok(amounts) -> str:
     return f"{f(lo)}억" if lo == hi else f"{f(lo)}~{f(hi)}억"
 
 def price_badge_slack(item: dict) -> str:
-    """슬랙 가격 태그 (유형 뒤에 배치). 가격 있으면 `💰3.9~6.7억`, 없으면 `💰?`. 항상 뒤에 공백."""
+    """슬랙 가격 태그 (유형 뒤에 배치).
+    - 직접값(API/Mdl): `💰3.9~6.7억` (확정)
+    - 추정값(캐시 P25~P75): `📊보증금... (추정)` (시세 통계)
+    - 없음: `💰?` (가격정보 없음). 항상 뒤에 공백."""
     p = (item.get("가격") or "").strip()
-    return f"`💰{p}` " if p else "`💰?` "
+    if not p:
+        return "`💰?` "
+    if not item.get("가격_직접"):
+        return f"`📊{p} (추정)` "
+    return f"`💰{p}` "
 
 def notice_key(item: dict) -> str:
     """신규 감지용 고유 키 (공고명+출처 해시)"""
@@ -332,6 +339,7 @@ def make_item(cat, src, type_, title, region, post_date, deadline, status, views
         "대상계층":    layers_from_text(title, type_),   # 공급대상 계층 (청약홈은 Mdl로 override)
         "대상계층_확인": False,   # 특공 계층 확인 여부 (청약홈 Mdl 조회 시 True, 그 외 키워드 추정)
         "가격":        "",        # 분양가 등 (청약홈 Mdl에서 채움). 예: '3.9~6.7억'
+        "가격_직접":   False,     # True=API 직접값(마이홈 rentGtn 등), False=캐시 P25~P75 추정
         "링크":        link,
         "is_new":      False,   # 나중에 감지 단계에서 업데이트
     }
@@ -615,10 +623,23 @@ def scrape_myhome() -> list[dict]:
             type_    = (it.get("suplyTyNm") or "").strip() or "공공임대"
             deadline = _fmt_ymd(it.get("endDe") or it.get("przwnerPresnatnDe") or "")
             link     = (it.get("url") or "").strip() or "https://www.myhome.go.kr"
-            results.append(make_item(
+            item = make_item(
                 "장기임대", "마이홈포털", type_, title, region,
                 post_dt, deadline, "모집중", "", link
-            ))
+            )
+            # 💰 직접 가격 (HWSPR02 rentGtn=보증금, mtRntchrg=월임대료 — 원 단위 가정, 단지정보와 동일 패밀리)
+            try:
+                bo = int(it.get("rentGtn") or 0)
+                wo = int(it.get("mtRntchrg") or 0)
+            except (TypeError, ValueError):
+                bo, wo = 0, 0
+            parts = []
+            if bo > 0: parts.append(f"보증금{_fmt_won_to_man(bo)}")
+            if wo > 0: parts.append(f"월{_fmt_won_to_man(wo)}")
+            if parts:
+                item["가격"] = " / ".join(parts)
+                item["가격_직접"] = True
+            results.append(item)
 
     log(f"  ✅ 마이홈포털 임대 완료: {len(results)}건")
     return results
@@ -642,10 +663,22 @@ def scrape_myhome_sale() -> list[dict]:
             type_    = _myhome_type_from_house(houseTy)
             pbancDe  = it.get("pbancDe") or ""
             deadline = it.get("przwnerPresentnDe") or it.get("rcritPblancDe") or ""
-            results.append(make_item(
+            item = make_item(
                 "청약·공공분양", "마이홈포털", type_, pbancNm, region,
                 pbancDe, deadline, "모집중", "", PORTAL_LIST
-            ))
+            )
+            # 💰 직접 분양가 (HWSPR02 enty=계약금, prtpay=중도금, surlus=잔금 — 원 단위 가정)
+            try:
+                enty   = int(it.get("enty")   or 0)
+                prtpay = int(it.get("prtpay") or 0)
+                surlus = int(it.get("surlus") or 0)
+            except (TypeError, ValueError):
+                enty, prtpay, surlus = 0, 0, 0
+            total = enty + prtpay + surlus
+            if total > 0:
+                item["가격"] = f"분양가{_fmt_won_to_man(total)}"
+                item["가격_직접"] = True
+            results.append(item)
 
     log(f"  ✅ 마이홈포털 분양 완료: {len(results)}건")
     return results
@@ -908,7 +941,7 @@ def build_lh_price_map(complex_data: list[dict]) -> tuple[dict, dict]:
     sgg_alias: 시군구 별칭 dict {alias_text → real_signgu_name}.
       예: '부천'→'부천시', '강남'→'강남구', '용인 기흥'→'용인시 기흥구'."""
     from collections import defaultdict
-    pm: dict = defaultdict(lambda: {"보증금": [], "월임대료": []})
+    pm: dict = defaultdict(lambda: {"보증금": [], "월임대료": [], "전환한도": []})
     sgg_real: set = set()
     for d in complex_data or []:
         sido = (d.get("시도") or "").strip()
@@ -919,8 +952,10 @@ def build_lh_price_map(complex_data: list[dict]) -> tuple[dict, dict]:
         sgg_real.add(sgg)
         bo = d.get("보증금") or 0
         wo = d.get("월임대료") or 0
+        cv = d.get("전환보증금한도") or 0
         if bo > 0: pm[(sido, sgg, sup)]["보증금"].append(int(bo))
         if wo > 0: pm[(sido, sgg, sup)]["월임대료"].append(int(wo))
+        if cv > 0: pm[(sido, sgg, sup)]["전환한도"].append(int(cv))
     # 시군구 별칭 빌드 — 긴 키부터 매칭하도록 정렬
     sgg_alias: dict = {}
     for sgg in sgg_real:
@@ -990,7 +1025,7 @@ def match_lh_price(item: dict, price_map: dict, sgg_alias: dict) -> str:
     elif "경기" in region:  sidos = ["경기도"]
     else: sidos = ["서울특별시", "경기도"]
     # 매칭된 그룹 합산
-    bo_list, wo_list = [], []
+    bo_list, wo_list, cv_list = [], [], []
     if matched_signgus and suppls:
         for sido in sidos:
             for sgg in matched_signgus:
@@ -999,18 +1034,21 @@ def match_lh_price(item: dict, price_map: dict, sgg_alias: dict) -> str:
                     if grp:
                         bo_list.extend(grp["보증금"])
                         wo_list.extend(grp["월임대료"])
+                        cv_list.extend(grp.get("전환한도", []))
     # Fallback 1: 시군구 매칭 안 되면 시도+공급유형으로 전체 합산
     if not bo_list and not wo_list and suppls:
         for (sido, sgg, sup), grp in price_map.items():
             if sido in sidos and sup in suppls:
                 bo_list.extend(grp["보증금"])
                 wo_list.extend(grp["월임대료"])
+                cv_list.extend(grp.get("전환한도", []))
     # Fallback 2: 공급유형도 모르면 시군구+전체유형
     if not bo_list and not wo_list and matched_signgus:
         for (sido, sgg, sup), grp in price_map.items():
             if sido in sidos and sgg in matched_signgus:
                 bo_list.extend(grp["보증금"])
                 wo_list.extend(grp["월임대료"])
+                cv_list.extend(grp.get("전환한도", []))
     if not bo_list and not wo_list:
         return ""
     bo_sorted = sorted(bo_list)
@@ -1028,7 +1066,14 @@ def match_lh_price(item: dict, price_map: dict, sgg_alias: dict) -> str:
             parts.append(f"월{_fmt_won_to_man(wo_lo)}")
         else:
             parts.append(f"월{_fmt_won_to_man(wo_lo)}~{_fmt_won_to_man(wo_hi)}")
-    return " / ".join(parts) if parts else ""
+    base = " / ".join(parts) if parts else ""
+    # 🔄 전환보증금 한도 부가 표시 (P50 중앙값) — 있을 때만
+    if base and cv_list:
+        cv_sorted = sorted(cv_list)
+        cv_mid = _percentile(cv_sorted, 50)
+        if cv_mid and cv_mid > 0:
+            base += f" 🔄전환한도{_fmt_won_to_man(cv_mid)}"
+    return base
 
 def fetch_soco_price_map(session) -> dict:
     """청년안심 단지비교(maplist.json) → {단지명: {'gu':자치구, 'price':'월16만~77만'}}.
@@ -1124,6 +1169,7 @@ def scrape_seoul_youth() -> list[dict]:
                                  str(it.get("inqireCo") or ""), link)
                 if price:
                     item["가격"] = price
+                    item["가격_직접"] = True   # soco 단지비교 직접값
                 results.append(item)
             tot_page = int((data.get("pagingInfo") or {}).get("totPage", 1) or 1)
             if all_too_old or page >= tot_page:
@@ -1258,6 +1304,7 @@ def scrape_cheongyanghome() -> list[dict]:
                     item["대상계층_확인"] = True   # 청약홈 Mdl로 특공 계층 확인 완료
                     if mdl_price:
                         item["가격"] = mdl_price
+                        item["가격_직접"] = True   # LTTOT_TOP_AMOUNT 직접값
                     results.append(item)
                     page_found += 1
 
@@ -1503,6 +1550,7 @@ def scrape_complex() -> list[dict]:
                             "세대수":     int(it.get("hshldCo", 0) or 0),
                             "보증금":     int(it.get("bassRentGtn", 0) or 0),
                             "월임대료":   int(it.get("bassMtRntchrg", 0) or 0),
+                            "전환보증금한도": int(it.get("bassCnvrsGtnLmt", 0) or 0),
                             "난방방식":   it.get("heatMthdDetailNm", ""),
                             "건물유형":   it.get("buldStleNm", ""),
                             "주차대수":   int(it.get("parkngCo", 0) or 0),
@@ -3506,25 +3554,34 @@ def main():
             merged_layers = merge_layers(best[key].get("대상계층"), d.get("대상계층"))
             # 확인 여부도 OR — 한 버전이라도 청약홈 Mdl로 확인됐으면 확인됨 처리
             merged_verified = bool(best[key].get("대상계층_확인") or d.get("대상계층_확인"))
-            # 가격도 어느 버전이든 비어있지 않은 값 보존
-            merged_price = (best[key].get("가격") or "").strip() or (d.get("가격") or "").strip()
+            # 가격: 직접값 우선, 둘 다 직접 or 둘 다 추정이면 비어있지 않은 값 보존
+            b_p, b_dir = (best[key].get("가격") or "").strip(), bool(best[key].get("가격_직접"))
+            d_p, d_dir = (d.get("가격") or "").strip(), bool(d.get("가격_직접"))
+            if b_dir and b_p:
+                merged_price, merged_direct = b_p, True
+            elif d_dir and d_p:
+                merged_price, merged_direct = d_p, True
+            else:
+                merged_price = b_p or d_p
+                merged_direct = False
             if _merge_rank(d) > _merge_rank(best[key]):
                 best[key] = d   # 더 풍부한(구·마감 有) 버전으로 교체, 위치는 최초 등장 순 유지
             best[key]["대상계층"] = merged_layers
             best[key]["대상계층_확인"] = merged_verified
             best[key]["가격"] = merged_price
+            best[key]["가격_직접"] = merged_direct
     unique = [best[k] for k in order]
 
     log(f"\n📋 수집: {len(all_data)}건 → 중복제거 후 {len(unique)}건 (소스 통합 포함)")
 
-    # ── LH·SH·마이홈 임대 공고에 가격 보강 (마이홈 단지정보 캐시 활용) ────
+    # ── LH·SH·마이홈 임대 공고에 가격 보강 (마이홈 단지정보 캐시 활용 — 추정) ────
     if complex_data:
         lh_price_map, sgg_alias = build_lh_price_map(complex_data)
         _PRICE_SOURCES = {"LH청약플러스", "SH공사", "GH(경기주택도시공사)", "마이홈포털", "LH공사API"}
         matched = 0
         for d in unique:
             if (d.get("가격") or "").strip():
-                continue  # 이미 가격 있으면 skip (청약홈 분양 / 청년안심 등)
+                continue  # 이미 가격 있으면 skip (직접값 — 청약홈 분양 / 청년안심 / 마이홈 임대 직접 등)
             if d.get("출처") not in _PRICE_SOURCES:
                 continue
             if d.get("카테고리") != "장기임대":
@@ -3532,8 +3589,15 @@ def main():
             price = match_lh_price(d, lh_price_map, sgg_alias)
             if price:
                 d["가격"] = price
+                d["가격_직접"] = False   # 캐시 P25~P75 추정
                 matched += 1
-        log(f"  💰 LH/SH 임대 가격 매칭: {matched}건 (단지정보 {len(complex_data):,}건 기반)")
+        log(f"  💰 LH/SH 임대 가격 매칭(추정): {matched}건 (단지정보 {len(complex_data):,}건 기반)")
+
+    # 📊 직접 vs 추정 가격 카운트 로그
+    direct_cnt = sum(1 for d in unique if (d.get("가격") or "").strip() and d.get("가격_직접"))
+    est_cnt    = sum(1 for d in unique if (d.get("가격") or "").strip() and not d.get("가격_직접"))
+    empty_cnt  = sum(1 for d in unique if not (d.get("가격") or "").strip())
+    log(f"  📊 가격 분포: 직접={direct_cnt}건 | 추정={est_cnt}건 | 없음={empty_cnt}건 (총 {len(unique)}건)")
 
     # 신규 감지
     unique, new_count = detect_new(unique)
