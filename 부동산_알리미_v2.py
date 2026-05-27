@@ -879,6 +879,157 @@ SOCO_LIST = SOCO_BASE + "/youth/pgm/home/yohome/bbsListJson.json"      # POST(JS
 SOCO_VIEW = SOCO_BASE + "/youth/bbs/BMSR00015/view.do?menuNo=400008&boardId="
 SOCO_MAP  = SOCO_BASE + "/youth/pgm/home/yohome/maplist.json"          # 단지별 보증금·월세·자치구
 
+# ══════════════════════════════════════════════
+# 💰 LH·SH 가격 매칭 — 마이홈 단지정보(HWSPR04) 캐시 활용
+#   마이홈 단지정보 API에 보증금·월임대료 필드 이미 포함 (96.9% 채워짐)
+#   (시도, 시군구, 공급유형) 단위로 그룹화 → P25~P75 범위로 공고에 적용
+# ══════════════════════════════════════════════
+# LH/SH/마이홈 공고 유형 → 마이홈 캐시 공급유형 매핑 (substring 매칭 키)
+_LH_SUPPLY_TYPE_RULES = [
+    ("매입임대",     ["매입임대"]),
+    ("행복주택",     ["행복주택"]),
+    ("국민임대",     ["국민임대"]),
+    ("영구임대",     ["영구임대"]),
+    ("장기전세",     ["장기전세"]),
+    ("통합공공임대", ["통합공공임대", "행복주택", "국민임대"]),
+    ("전세임대",     ["매입임대"]),
+    ("신혼희망",     ["행복주택", "매입임대"]),
+    ("신혼·신생아",  ["매입임대", "행복주택"]),
+    ("기존주택",     ["매입임대"]),
+    ("10년임대",     ["10년임대"]),
+    ("50년임대",     ["50년임대"]),
+    ("5년임대",      ["5년임대"]),
+    ("공공임대",     ["매입임대", "행복주택", "국민임대"]),
+]
+
+def build_lh_price_map(complex_data: list[dict]) -> tuple[dict, dict]:
+    """단지정보 캐시 → (price_map, sgg_alias).
+    price_map: {(시도,시군구,공급유형): {'보증금':[..], '월임대료':[..]}}.
+    sgg_alias: 시군구 별칭 dict {alias_text → real_signgu_name}.
+      예: '부천'→'부천시', '강남'→'강남구', '용인 기흥'→'용인시 기흥구'."""
+    from collections import defaultdict
+    pm: dict = defaultdict(lambda: {"보증금": [], "월임대료": []})
+    sgg_real: set = set()
+    for d in complex_data or []:
+        sido = (d.get("시도") or "").strip()
+        sgg  = (d.get("시군구") or "").strip()
+        sup  = (d.get("공급유형") or "").strip()
+        if not (sido and sgg and sup):
+            continue
+        sgg_real.add(sgg)
+        bo = d.get("보증금") or 0
+        wo = d.get("월임대료") or 0
+        if bo > 0: pm[(sido, sgg, sup)]["보증금"].append(int(bo))
+        if wo > 0: pm[(sido, sgg, sup)]["월임대료"].append(int(wo))
+    # 시군구 별칭 빌드 — 긴 키부터 매칭하도록 정렬
+    sgg_alias: dict = {}
+    for sgg in sgg_real:
+        sgg_alias[sgg] = sgg                  # 풀네임 자기참조
+        # "부천시" → "부천", "강남구" → "강남" (마지막 시/군/구 제거)
+        for suf in ("시", "군", "구"):
+            if sgg.endswith(suf) and len(sgg) > 2:
+                short = sgg[:-1]
+                # 중복(예: 강남구·강남시 같이) 시 풀네임 우선
+                if short not in sgg_alias:
+                    sgg_alias[short] = sgg
+        # "용인시 기흥구" → "기흥구" / "기흥" 매칭도 가능하도록
+        if " " in sgg:
+            parts = sgg.split()
+            for p in parts:
+                if p not in sgg_alias:
+                    sgg_alias[p] = sgg
+                if len(p) > 2 and p[-1] in "시군구" and p[:-1] not in sgg_alias:
+                    sgg_alias[p[:-1]] = sgg
+    return dict(pm), sgg_alias
+
+def _fmt_won_to_man(won: int) -> str:
+    """원 → '286만' / '5,000만' / '3억'. 만원 단위 반올림."""
+    man = round(won / 10000)
+    if man >= 10000:
+        eok = man // 10000
+        rem = man % 10000
+        return f"{eok}억" if rem == 0 else f"{eok}.{rem//1000}억"
+    return f"{man}만"
+
+def _percentile(sorted_list, p):
+    """sorted_list에서 p-percentile 값 (0~100)."""
+    if not sorted_list:
+        return None
+    n = len(sorted_list)
+    if n == 1:
+        return sorted_list[0]
+    k = max(0, min(n-1, int(round(p/100 * (n-1)))))
+    return sorted_list[k]
+
+def match_lh_price(item: dict, price_map: dict, sgg_alias: dict) -> str:
+    """LH/SH/마이홈 공고에 시군구+공급유형 매칭으로 보증금·월임대료 P25~P75 범위 산출.
+    반환: '보증금200만~3000만 / 월18만~78만' 또는 ''.
+    sgg_alias: {alias_text → real_signgu_name}. 별칭(부천=부천시)도 매칭."""
+    text = f"{item.get('공고명','')} {item.get('지역','')} {item.get('유형','')}"
+    # 시군구 추출: alias 중 텍스트에 포함된 것 (긴 alias부터 매칭해야 '용인시 기흥구' 우선)
+    aliases_sorted = sorted(sgg_alias.keys(), key=len, reverse=True)
+    matched_signgus: list = []
+    used_text = text
+    for alias in aliases_sorted:
+        if alias in used_text:
+            real_sgg = sgg_alias[alias]
+            if real_sgg not in matched_signgus:
+                matched_signgus.append(real_sgg)
+            # 매칭 위치를 마스킹해서 중복 매칭 방지 (예: '용인시 기흥구' 매칭 후 '용인시' 재매칭 안됨)
+            used_text = used_text.replace(alias, "·" * len(alias), 1)
+    # 공급유형 후보 추출 (다중 가능)
+    suppls = []
+    for keyword, targets in _LH_SUPPLY_TYPE_RULES:
+        if keyword in text:
+            for t in targets:
+                if t not in suppls:
+                    suppls.append(t)
+    # 시도 후보
+    region = item.get("지역", "") + " " + item.get("공고명", "")
+    if "서울" in region:    sidos = ["서울특별시"]
+    elif "경기" in region:  sidos = ["경기도"]
+    else: sidos = ["서울특별시", "경기도"]
+    # 매칭된 그룹 합산
+    bo_list, wo_list = [], []
+    if matched_signgus and suppls:
+        for sido in sidos:
+            for sgg in matched_signgus:
+                for sup in suppls:
+                    grp = price_map.get((sido, sgg, sup))
+                    if grp:
+                        bo_list.extend(grp["보증금"])
+                        wo_list.extend(grp["월임대료"])
+    # Fallback 1: 시군구 매칭 안 되면 시도+공급유형으로 전체 합산
+    if not bo_list and not wo_list and suppls:
+        for (sido, sgg, sup), grp in price_map.items():
+            if sido in sidos and sup in suppls:
+                bo_list.extend(grp["보증금"])
+                wo_list.extend(grp["월임대료"])
+    # Fallback 2: 공급유형도 모르면 시군구+전체유형
+    if not bo_list and not wo_list and matched_signgus:
+        for (sido, sgg, sup), grp in price_map.items():
+            if sido in sidos and sgg in matched_signgus:
+                bo_list.extend(grp["보증금"])
+                wo_list.extend(grp["월임대료"])
+    if not bo_list and not wo_list:
+        return ""
+    bo_sorted = sorted(bo_list)
+    wo_sorted = sorted(wo_list)
+    bo_lo, bo_hi = _percentile(bo_sorted, 25), _percentile(bo_sorted, 75)
+    wo_lo, wo_hi = _percentile(wo_sorted, 25), _percentile(wo_sorted, 75)
+    parts = []
+    if bo_lo and bo_hi:
+        if bo_lo == bo_hi:
+            parts.append(f"보증금{_fmt_won_to_man(bo_lo)}")
+        else:
+            parts.append(f"보증금{_fmt_won_to_man(bo_lo)}~{_fmt_won_to_man(bo_hi)}")
+    if wo_lo and wo_hi:
+        if wo_lo == wo_hi:
+            parts.append(f"월{_fmt_won_to_man(wo_lo)}")
+        else:
+            parts.append(f"월{_fmt_won_to_man(wo_lo)}~{_fmt_won_to_man(wo_hi)}")
+    return " / ".join(parts) if parts else ""
+
 def fetch_soco_price_map(session) -> dict:
     """청년안심 단지비교(maplist.json) → {단지명: {'gu':자치구, 'price':'월16만~77만'}}.
     공고에 가격·자치구 보강용. 실패해도 빈 dict."""
@@ -3365,6 +3516,24 @@ def main():
     unique = [best[k] for k in order]
 
     log(f"\n📋 수집: {len(all_data)}건 → 중복제거 후 {len(unique)}건 (소스 통합 포함)")
+
+    # ── LH·SH·마이홈 임대 공고에 가격 보강 (마이홈 단지정보 캐시 활용) ────
+    if complex_data:
+        lh_price_map, sgg_alias = build_lh_price_map(complex_data)
+        _PRICE_SOURCES = {"LH청약플러스", "SH공사", "GH(경기주택도시공사)", "마이홈포털", "LH공사API"}
+        matched = 0
+        for d in unique:
+            if (d.get("가격") or "").strip():
+                continue  # 이미 가격 있으면 skip (청약홈 분양 / 청년안심 등)
+            if d.get("출처") not in _PRICE_SOURCES:
+                continue
+            if d.get("카테고리") != "장기임대":
+                continue  # 임대 공고에만 (분양은 별도)
+            price = match_lh_price(d, lh_price_map, sgg_alias)
+            if price:
+                d["가격"] = price
+                matched += 1
+        log(f"  💰 LH/SH 임대 가격 매칭: {matched}건 (단지정보 {len(complex_data):,}건 기반)")
 
     # 신규 감지
     unique, new_count = detect_new(unique)
