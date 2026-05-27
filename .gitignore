@@ -1,0 +1,25 @@
+# 🔒 시크릿 (절대 커밋 금지)
+slack_config.json
+.env
+.env.local
+*.key
+
+# 로컬 캐시·상태 (Supabase로 이전됨)
+seen_notices.json
+seen_notices_test.json
+단지정보_캐시.json
+user_prefs.json
+
+# 산출물 (Actions가 생성·배포)
+부동산_대시보드.html
+budongsan_orig.html
+수집로그*.txt
+
+# 로컬 배포 폴더 (CI에선 미사용)
+.deploy/
+
+# 파이썬
+__pycache__/
+*.pyc
+.venv/
+venv/

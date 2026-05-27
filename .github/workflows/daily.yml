@@ -1,0 +1,64 @@
+name: budongsan-alimi-daily
+
+on:
+  schedule:
+    - cron: '5 3 * * *'        # 매일 12:05 KST (UTC 03:05). GitHub cron은 UTC이며 부하 시 수 분 지연 가능
+  workflow_dispatch:            # 수동 실행 버튼
+    inputs:
+      dry_run:
+        description: '슬랙 발송 없이 미리보기만 (true 권장: 첫 테스트)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 부동산 알리미 실행 (수집·발송·HTML 생성)
+        env:
+          MYHOME_API_KEY:    ${{ secrets.MYHOME_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SUPABASE_DB_URL:   ${{ secrets.SUPABASE_DB_URL }}
+          # 수동 실행 시 dry_run=true면 슬랙 미발송. 정기(cron) 실행 땐 빈 값이라 정상 발송.
+          ALIMI_DRY_RUN:     ${{ github.event.inputs.dry_run }}
+        run: python 부동산_알리미_v2.py
+
+      - name: Pages 산출물 준비 (HTML → _site/index.html)
+        run: |
+          mkdir -p _site
+          cp 부동산_대시보드.html _site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
