@@ -763,6 +763,56 @@ docx 출처: `기술문서_청약홈 분양정보 조회 서비스_260129.docx`
 
 ---
 
+## 부록 C — 💰 가격 추출 매핑 표 (2026-05-28 신설)
+
+> 알리미가 슬랙 배지(`💰...` / `📊...`)에 표시하는 가격 정보가 **어느 API의 어느 필드에서, 어느 코드 함수를 거쳐, 어떤 형식으로** 출력되는지 한눈에 보기 위한 표. 가격 작업의 단일 진실 공급원(single source of truth).
+>
+> 상세 추출 알고리즘·검증 이력은 같은 폴더의 `price-extraction-guide.md` 참조.
+
+### C-1. 출처별 가격 필드 (공식 명세 기준)
+
+| # | 출처(API/사이트) | 카테고리 | 가격 필드 (공식) | 단위 | 코드 함수 | 슬랙 배지 |
+|---|---|---|---|---|---|---|
+| 1 | 마이홈 HWSPR02 `rsdtRcritNtcList` | 임대 모집공고 | (공고 단위에는 가격 필드 없음 — HWSPR04 단지 캐시로 매칭) | – | `scrape_myhome()` | (캐시 매칭) |
+| 2 | 마이홈 HWSPR02 `ltRsdtRcritNtcList` | 분양 모집공고 | `enty`+`prtpay`+`surlus` (계약금+중도금+잔금) | 원 | `scrape_myhome_sale()` L670-680 | `💰분양가XX억` |
+| 3 | 마이홈 HWSPR04 `getRsdtCmpInfoList` | 단지 캐시 | `bassRentGtn`(보증금)·`bassMtRntchrg`(월임대료)·`bassCnvrsGtnLmt`(전환보증금한도) | 원 | `scrape_complex()` L1551-1553 | (캐시 → P25~P75 추정) |
+| 4 | LH 분양임대공고문 `lhLeaseNoticeInfo1` | 임대/분양 공고 목록 | **본 API에 가격 필드 없음** | – | `scrape_lh_api()` L1346 | (마이홈 캐시로 추정) |
+| 4-후속 | LH "공급정보 조회" (미구현) | 임대조건 상세 | `SPL_INF_TP_CD`+`CCR_CNNT_SYS_DS_CD`+`PAN_ID` 키로 별도 호출 | – | ❌ 미구현 (Issue D) | – |
+| 5 | 청약홈 `getAPTLttotPblancMdl` | APT 분양 (주택형별) | `LTTOT_TOP_AMOUNT` 공급금액(분양최고) | 만원 | `fetch_cheong_mdl_layers()` L1206 | `💰X.X~Y.Y억` |
+| 6 | 청약홈 `getAPTLttotPblancDetail` | APT 분양 (공고 단위) | 가격 필드 없음 (Mdl에서 조회) | – | – | – |
+| 7 | soco.seoul.go.kr `maplist.json` | 청년안심주택 | `rentGuarantyMin/Max`·`monthlyMin/Max` | 원·만원 | `fetch_soco_price_map()` | `💰월X만~Y만` |
+
+### C-2. LH/SH/GH 임대 가격 — 마이홈 캐시 기반 P25~P75 추정
+
+공고문(LH/SH/GH HTML 스크래핑·LH OpenAPI 모두)에는 임대조건이 PDF/JS로만 존재 → 직접 파싱 불가. 대신 마이홈 HWSPR04 단지정보 캐시(약 7만건, 96.9% 가격 채워짐)에서 **(시도, 시군구, 공급유형) 그룹의 P25~P75 분위수**를 매칭.
+
+| 함수 | 라인 | 역할 |
+|---|---|---|
+| `build_lh_price_map()` | L953 | 캐시를 (시도, 시군구, 공급유형) 그룹으로 분류 |
+| `match_lh_price()` | L1014 | 공고의 (시도, 시군구, 유형)으로 룩업 → P25~P75 범위 반환 |
+| `_LH_SUPPLY_TYPE_RULES` | L936 | LH/SH/GH 유형명 → 마이홈 `suplyTyNm` 매핑 (예: 행복주택→행복주택, 장기전세→장기전세) |
+| `_percentile()` | L1004 | numpy 없이 분위수 계산 |
+| `price_badge_slack()` | L223 | 직접값=`💰`, 추정=`📊`로 시각화 차별화 |
+
+### C-3. 청약홈 Mdl 특공물량 ↔ 대상계층 매핑 (가격은 아니지만 묶음)
+
+| 명세 필드 (소문자) | odcloud 응답 (대문자) | 한글 | 코드 상수 |
+|---|---|---|---|
+| `nwbb_hshldco` | `NWBB_HSHLDCO` | 신생아 | `TARGET_LAYERS[0]` |
+| `ygmn_hshldco` | `YGMN_HSHLDCO` | 청년 | `TARGET_LAYERS[1]` |
+| `nwwds_hshldco` | `NWWDS_HSHLDCO` | 신혼부부 | `TARGET_LAYERS[2]` |
+| `lfe_frst_hshldco` | `LFE_FRST_HSHLDCO` | 생애최초 | `TARGET_LAYERS[3]` |
+| `mnych_hshldco` | `MNYCH_HSHLDCO` | 다자녀가구 | `TARGET_LAYERS[4]` |
+| `old_parnts_suport_hshldco` | `OLD_PARNTS_SUPORT_HSHLDCO` | 노부모부양 | `TARGET_LAYERS[5]` |
+| `spsply_hshldco` | `SPSPLY_HSHLDCO` | **특공 합계** (검증용) | `layers_from_mdl` 일관성 점검 |
+| `instt_recomend_hshldco` | `INSTT_RECOMEND_HSHLDCO` | 기관추천 | (미사용) |
+| `etc_hshldco` | `ETC_HSHLDCO` | 기타 | (미사용) |
+| `transr_instt_enfsn_hshldco` | `TRANSR_INSTT_ENFSN_HSHLDCO` | 이전기관 | (미사용) |
+
+> ⚠️ **공공지원민간임대 분양 (별도 엔드포인트)**: 필드명이 다름 — `spsply_ygmn_hshldco`(청년)·`spsply_new_mrrg_hshldco`(신혼)·`spsply_aged_hshldco`(고령자). **현재 알리미는 청약홈에서 APT만 호출**하므로 영향 없음. 공공지원민간임대(청년안심)는 `scrape_seoul_youth()` (soco.seoul.go.kr) 경로로 별도 수집.
+
+---
+
 ## 🔐 인증키 관리 원칙
 
 1. **절대 코드/문서/커밋에 평문 노출 금지**. 본 문서는 모든 키를 `YOUR_SERVICE_KEY_HERE`로 마스킹.

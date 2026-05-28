@@ -150,14 +150,29 @@ def layers_from_text(title: str, type_text: str) -> list[str]:
     return found
 
 def layers_from_mdl(mdl_rows: list[dict]) -> list[str]:
-    """청약홈 주택형별(Mdl) 행들을 합산해 특공 물량>0인 계층 태그 반환 (정확)."""
+    """청약홈 주택형별(Mdl) 행들을 합산해 특공 물량>0인 계층 태그 반환 (정확).
+    + SPSPLY_HSHLDCO(특공 합계)는 명세 일관성 검증용 (6계층 합 ≤ SPSPLY 가 정상).
+       — 노출하지 않음. 불일치 시 stderr 경고.
+    참고: 청약홈 분양정보 조회 서비스 공식 명세 (15098547 표#23 APT 주택형별 응답)
+       .deploy/docs/api-spec/공식문서/15098547_청약홈_기술문서.docx"""
     totals = {field: 0 for _, _, field, _ in TARGET_LAYERS}
+    spsply_total = 0  # 명세: SPSPLY_HSHLDCO = 6계층 + 기관추천 + 기타 + 이전기관 합
     for row in mdl_rows:
         for _, _, field, _ in TARGET_LAYERS:
             try:
                 totals[field] += int(row.get(field) or 0)
             except (TypeError, ValueError):
                 pass
+        try:
+            spsply_total += int(row.get("SPSPLY_HSHLDCO") or 0)
+        except (TypeError, ValueError):
+            pass
+    six_sum = sum(totals.values())
+    if spsply_total > 0 and six_sum > spsply_total:
+        try:
+            log(f"  ⚠ Mdl 합계 검증: 6계층합({six_sum}) > SPSPLY({spsply_total}) — 명세 확인 필요")
+        except NameError:
+            pass
     return [tag for tag, _, field, _ in TARGET_LAYERS if totals[field] > 0]
 
 def merge_layers(*layer_lists) -> list[str]:
@@ -1342,6 +1357,11 @@ def scrape_lh_api() -> list[dict]:
     end_dt   = (today + timedelta(days=365)).strftime("%Y-%m-%d")
 
     # 유형코드 → 내부 유형명
+    # ⚠️ TODO(명세 충돌): 공식 명세(15058530 표#4 UPP_AIS_TP_CD)는 6종
+    #   (01=토지, 05=분양주택, 06=임대주택, 13=주거복지, 22=상가, 39=신혼희망타운)뿐.
+    #   07~11은 별도 AIS_TP_CD(매물 세부유형)일 가능성. LH API(현재 403)가 활성화되면
+    #   실제 응답의 UPP_AIS_TP_CD/AIS_TP_CD 값을 보고 매핑 재확인 필요.
+    #   참고: .deploy/docs/api-spec/공식문서/15058530_LH_분양임대공고문_활용가이드.docx
     TYPE_MAP = {
         "05": "분양주택", "06": "공공임대", "39": "공공분양(신혼희망)",
         "07": "국민임대", "08": "행복주택", "09": "영구임대",

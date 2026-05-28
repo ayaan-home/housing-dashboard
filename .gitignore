@@ -23,3 +23,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# 임시 백업·이동 파일
+*.bak
+*.bak.*
+*.moved
