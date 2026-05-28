@@ -1,0 +1,94 @@
+name: lh-api-diagnose
+
+# LH 분양임대공고문 API (15058530) 403 원인 진단용 ad-hoc 워크플로
+# - 수동 실행만 (workflow_dispatch). 자동 cron 없음.
+# - Slack 발송 / Pages 배포 / Supabase 쓰기 모두 없음. 읽기 전용 호출만.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install --quiet requests
+
+      - name: Run LH API diagnostics
+        env:
+          MYHOME_API_KEY: ${{ secrets.MYHOME_API_KEY }}
+        run: |
+          python - <<'PYEOF'
+          import os, sys, requests
+
+          key = os.environ.get("MYHOME_API_KEY") or ""
+          if not key:
+              print("Secret MYHOME_API_KEY not set.")
+              sys.exit(1)
+
+          print("="*70)
+          print("LH lhLeaseNoticeInfo1 (15058530) diagnosis")
+          print("="*70)
+          print(f"Key masked: {key[:10]}...{key[-5:]}  (len {len(key)})")
+          print()
+
+          base  = {"serviceKey": key, "PG_SZ": 5, "PAGE": 1, "type": "json"}
+          extra = {"PAN_ST_DT": "20260321", "PAN_ED_DT": "20260601"}
+
+          tests = [
+              ("A. http  + double path (current code)",
+                  "http://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1",  base),
+              ("B. https + double path",
+                  "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1", base),
+              ("C. https + single path (portal End Point)",
+                  "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1",                    base),
+              ("D. https + double path + required params",
+                  "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1", dict(base, **extra)),
+          ]
+
+          for label, url, params in tests:
+              print(f"--- {label}")
+              print(f"  URL    : {url}")
+              try:
+                  r = requests.get(url, params=params, timeout=15)
+                  body = r.text[:400].replace("\n", " ")
+                  print(f"  status : {r.status_code}")
+                  print(f"  ctype  : {r.headers.get('Content-Type', '-')}")
+                  print(f"  body   : {body!r}")
+              except Exception as e:
+                  print(f"  exception : {e!r}")
+              print()
+
+          print("--- Key validation: MyHome HWSPR04 (same key) ---")
+          try:
+              r = requests.get(
+                  "https://apis.data.go.kr/1613000/HWSPR04/getRsdtCmpInfoList",
+                  params={"serviceKey": key, "numOfRows": 1, "pageNo": 1,
+                          "brtcCode": "11", "format": "json"},
+                  timeout=15,
+              )
+              body = r.text[:300].replace("\n", " ")
+              print(f"  status : {r.status_code}")
+              print(f"  ctype  : {r.headers.get('Content-Type', '-')}")
+              print(f"  body[:300]: {body!r}")
+              if r.status_code == 200:
+                  print("  => OK: key is valid (LH dataset issue only)")
+              else:
+                  print("  => WARN: key itself failing")
+          except Exception as e:
+              print(f"  exception : {e!r}")
+
+          print()
+          print("="*70)
+          print("Done. Copy this output to chat.")
+          print("="*70)
+          PYEOF
