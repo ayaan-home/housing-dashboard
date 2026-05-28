@@ -3,6 +3,8 @@ name: lh-api-diagnose
 # LH 분양임대공고문 API (15058530) 403 원인 진단용 ad-hoc 워크플로
 # - 수동 실행만 (workflow_dispatch). 자동 cron 없음.
 # - Slack 발송 / Pages 배포 / Supabase 쓰기 모두 없음. 읽기 전용 호출만.
+# - 4가지 URL 변형 + 같은 키로 마이홈 HWSPR04 동시 호출하여 키 자체 정상 여부 동시 검증.
+# - 결과는 Actions 로그에 출력 (키는 항상 마스킹).
 
 on:
   workflow_dispatch:
@@ -28,30 +30,30 @@ jobs:
           MYHOME_API_KEY: ${{ secrets.MYHOME_API_KEY }}
         run: |
           python - <<'PYEOF'
-          import os, sys, requests
+          import os, sys, requests, json
 
           key = os.environ.get("MYHOME_API_KEY") or ""
           if not key:
-              print("Secret MYHOME_API_KEY not set.")
+              print("❌ Secret MYHOME_API_KEY 가 없습니다.")
               sys.exit(1)
 
           print("="*70)
-          print("LH lhLeaseNoticeInfo1 (15058530) diagnosis")
+          print("LH 분양임대공고문 API (15058530) 진단")
           print("="*70)
-          print(f"Key masked: {key[:10]}...{key[-5:]}  (len {len(key)})")
+          print(f"키 마스킹 : {key[:10]}...{key[-5:]}  (길이 {len(key)}자)")
           print()
 
           base  = {"serviceKey": key, "PG_SZ": 5, "PAGE": 1, "type": "json"}
           extra = {"PAN_ST_DT": "20260321", "PAN_ED_DT": "20260601"}
 
           tests = [
-              ("A. http  + double path (current code)",
+              ("A. http  + 더블경로 (코드 현재)",
                   "http://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1",  base),
-              ("B. https + double path",
+              ("B. https + 더블경로",
                   "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1", base),
-              ("C. https + single path (portal End Point)",
+              ("C. https + 싱글경로 (포털 End Point 표기)",
                   "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1",                    base),
-              ("D. https + double path + required params",
+              ("D. https + 더블경로 + 필수파라미터(PAN_ST_DT/ED_DT)",
                   "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1", dict(base, **extra)),
           ]
 
@@ -65,10 +67,11 @@ jobs:
                   print(f"  ctype  : {r.headers.get('Content-Type', '-')}")
                   print(f"  body   : {body!r}")
               except Exception as e:
-                  print(f"  exception : {e!r}")
+                  print(f"  예외   : {e!r}")
               print()
 
-          print("--- Key validation: MyHome HWSPR04 (same key) ---")
+          # 같은 키로 마이홈 HWSPR04 검증 — 키 자체 정상 여부 확인
+          print("--- 키 자체 검증: 마이홈 HWSPR04 (같은 키로 호출) ---")
           try:
               r = requests.get(
                   "https://apis.data.go.kr/1613000/HWSPR04/getRsdtCmpInfoList",
@@ -81,14 +84,14 @@ jobs:
               print(f"  ctype  : {r.headers.get('Content-Type', '-')}")
               print(f"  body[:300]: {body!r}")
               if r.status_code == 200:
-                  print("  => OK: key is valid (LH dataset issue only)")
+                  print("  → ✅ 키는 정상 (LH 데이터셋만 문제)")
               else:
-                  print("  => WARN: key itself failing")
+                  print("  → ⚠ 키 자체가 문제 (마이홈도 실패)")
           except Exception as e:
-              print(f"  exception : {e!r}")
+              print(f"  예외   : {e!r}")
 
           print()
           print("="*70)
-          print("Done. Copy this output to chat.")
+          print("진단 완료. 위 결과를 그대로 Claude 채팅에 붙여넣어 주세요.")
           print("="*70)
           PYEOF
